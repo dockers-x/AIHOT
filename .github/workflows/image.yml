@@ -38,10 +38,10 @@ jobs:
                    -H "Accept: application/vnd.github.raw" 2>/dev/null || true)
           if [ -n "$have" ]; then
             echo "have_sha=$(printf '%s' "$have" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("sha",""))')" >> "$GITHUB_OUTPUT"
-            echo "have_version=$(printf '%s' "$have" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("version",0))')" >> "$GITHUB_OUTPUT"
+            echo "have_patch=$(printf '%s' "$have" | python3 -c 'import json,sys;print(str(json.load(sys.stdin).get("version","1.0.0")).split(".")[-1])')" >> "$GITHUB_OUTPUT"
           else
             echo "have_sha=" >> "$GITHUB_OUTPUT"
-            echo "have_version=0" >> "$GITHUB_OUTPUT"
+            echo "have_patch=0" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Decide
@@ -50,7 +50,7 @@ jobs:
           set -euo pipefail
           if [ "${{ steps.state.outputs.sha }}" != "${{ steps.state.outputs.have_sha }}" ] || [ "${{ inputs.force }}" = "true" ]; then
             echo "build=true" >> "$GITHUB_OUTPUT"
-            echo "version=1.0.$(( ${{ steps.state.outputs.have_version }} + 1 ))" >> "$GITHUB_OUTPUT"
+            echo "version=1.0.$(( ${{ steps.state.outputs.have_patch }} + 1 ))" >> "$GITHUB_OUTPUT"
           else
             echo "build=false" >> "$GITHUB_OUTPUT"
           fi
