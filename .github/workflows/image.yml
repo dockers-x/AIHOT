@@ -1,0 +1,103 @@
+name: Build and push image
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build even when upstream has not changed
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: aihot-image
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compare upstream main with the last build
+        id: state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init -q upstream
+          git -C upstream remote add origin https://github.com/KKKKhazix/AIHOT.git
+          git -C upstream fetch -q --depth 1 origin main
+          sha=$(git -C upstream rev-parse FETCH_HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+          have=$(gh api "repos/${{ github.repository }}/contents/upstream.json" \
+                   -H "Accept: application/vnd.github.raw" 2>/dev/null || true)
+          if [ -n "$have" ]; then
+            echo "have_sha=$(printf '%s' "$have" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("sha",""))')" >> "$GITHUB_OUTPUT"
+            echo "have_version=$(printf '%s' "$have" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("version",0))')" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_sha=" >> "$GITHUB_OUTPUT"
+            echo "have_version=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Decide
+        id: decide
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.state.outputs.sha }}" != "${{ steps.state.outputs.have_sha }}" ] || [ "${{ inputs.force }}" = "true" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "version=1.0.$(( ${{ steps.state.outputs.have_version }} + 1 ))" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out upstream
+        if: steps.decide.outputs.build == 'true'
+        uses: actions/checkout@v5
+        with:
+          repository: KKKKhazix/AIHOT
+          ref: ${{ steps.state.outputs.sha }}
+
+      - name: Log in to GHCR
+        if: steps.decide.outputs.build == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push
+        if: steps.decide.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --platform linux/amd64 \
+            --label "org.opencontainers.image.source=https://github.com/KKKKhazix/AIHOT" \
+            --label "org.opencontainers.image.revision=${{ steps.state.outputs.sha }}" \
+            -t "ghcr.io/${{ github.repository_owner }}/aihot:${{ steps.decide.outputs.version }}" \
+            --push .
+
+      - name: Record the built upstream commit
+        if: steps.decide.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          content=$(printf '{\n  "sha": "%s",\n  "version": "%s"\n}\n' \
+            "${{ steps.state.outputs.sha }}" "${{ steps.decide.outputs.version }}" | base64 -w0)
+          file_sha=$(gh api "repos/${{ github.repository }}/contents/upstream.json" --jq .sha 2>/dev/null || true)
+          short=$(printf '%s' "${{ steps.state.outputs.sha }}" | cut -c1-7)
+          if [ -n "$file_sha" ]; then
+            gh api -X PUT "repos/${{ github.repository }}/contents/upstream.json" \
+              -f message="chore: record build ${{ steps.decide.outputs.version }} (upstream $short)" \
+              -f content="$content" -f sha="$file_sha" -f branch=main >/dev/null
+          else
+            gh api -X PUT "repos/${{ github.repository }}/contents/upstream.json" \
+              -f message="chore: record build ${{ steps.decide.outputs.version }} (upstream $short)" \
+              -f content="$content" -f branch=main >/dev/null
+          fi
+          echo "built ghcr.io/${{ github.repository_owner }}/aihot:${{ steps.decide.outputs.version }} from $short"
