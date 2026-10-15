@@ -82,6 +82,51 @@ for (const composite of [false, true]) test(`a ${composite ? "roundup" : "single
   assert.equal(done!.grouping_error, null);
 });
 
+// The grouping decision and the paid result it consumes must commit together. Without this,
+// a failed completion can leave an article grouped while its paid response stays "received".
+for (const kind of ["report", "roundup", "kept"] as const) test(`receipt completion failure rolls back ${kind} grouping and recovery reuses the response`, async () => {
+  const id = await report(`receipt-atomic-${kind}`, kind === "roundup");
+  if (kind === "kept") {
+    await sql`INSERT INTO fact_articles (fact_id, article_id, role) VALUES (${factId}, ${id}, 'report')`;
+    await sql`UPDATE articles SET selection_adds_value = NULL WHERE id = ${id}`;
+  }
+  await sql.unsafe(`CREATE FUNCTION fail_grouping_receipt() RETURNS trigger LANGUAGE plpgsql AS $body$ BEGIN
+    IF NEW.status = 'completed' AND NEW.purpose = 'group_article'
+      THEN RAISE EXCEPTION 'grouping receipt commit interrupted';
+    END IF;
+    RETURN NEW; END $body$`);
+  await sql`CREATE TRIGGER fail_grouping_receipt BEFORE UPDATE ON receipts FOR EACH ROW EXECUTE FUNCTION fail_grouping_receipt()`;
+  const before = provider.hits();
+  try {
+    await assert.rejects(groupArticle(id), /grouping receipt commit interrupted/);
+  } finally {
+    await sql`DROP TRIGGER fail_grouping_receipt ON receipts`;
+    await sql`DROP FUNCTION fail_grouping_receipt()`;
+  }
+  const after = provider.hits();
+  assert.ok(after > before, "the model response was received before the injected commit failure");
+  assert.equal((await sql`SELECT 1 FROM grouping_decisions WHERE article_id = ${id}`).length, 0, "the decision must roll back");
+  assert.equal((await sql`SELECT 1 FROM fact_articles WHERE article_id = ${id}`).length, kind === "kept" ? 1 : 0,
+    "no new membership can commit when receipt completion fails");
+  const [failed] = await sql<{ grouping_status: string }[]>`SELECT grouping_status FROM articles WHERE id = ${id}`;
+  assert.equal(failed!.grouping_status, "failed");
+  const receipts = await sql<{ purpose: string; status: string }[]>`
+    SELECT purpose, status FROM receipts WHERE purpose IN ('group_article', 'group_review')
+      AND subject LIKE ${`article:${id}%`} ORDER BY id`;
+  assert.ok(receipts.some((receipt) => receipt.purpose === "group_article"), "the batch judgement has a receipt");
+  assert.ok(receipts.every((receipt) => receipt.status === "received"), "no receipt completes on a rolled-back decision");
+
+  const result = await groupArticle(id);
+  assert.equal(result.verdict, kind === "roundup" ? "roundup" : kind === "kept" ? "kept" : "same-fact");
+  assert.equal(provider.hits(), after, "recovery must reuse the already paid response");
+  const completed = await sql<{ status: string }[]>`
+    SELECT status FROM receipts WHERE purpose IN ('group_article', 'group_review')
+      AND subject LIKE ${`article:${id}%`}`;
+  assert.equal(completed.length, receipts.length);
+  assert.ok(completed.every((receipt) => receipt.status === "completed"));
+  assert.equal((await sql`SELECT 1 FROM grouping_decisions WHERE article_id = ${id}`).length, 1);
+});
+
 test("a native timeout fails its job with the receipt id, and the release wakes that same job", async () => {
   const id = await report("timeout");
   const originalFetch = globalThis.fetch;
@@ -109,6 +154,32 @@ test("a native timeout fails its job with the receipt id, and the release wakes 
   await boss.complete(QUEUES.group, jobs[0]!.id);
   await sweepUngrouped();
   assert.equal((await boss.fetch(QUEUES.group)).length, 0, "successful work is not repeatedly queued");
+});
+
+test("a spent budget leaves grouping pending and the repair sweep resumes it", async () => {
+  const id = await report("budget-wait");
+  const budgets = await sql`SELECT service,per_minute,per_hour,per_day FROM budgets`;
+  const hits = provider.hits();
+  try {
+    await sql`UPDATE budgets SET per_minute=0,per_hour=0,per_day=0`;
+    await assert.rejects(groupArticle(id), /Budget for .* exhausted/);
+    const [row] = await sql`SELECT grouping_status,grouping_receipt_id FROM articles WHERE id=${id}`;
+    assert.equal(row!.grouping_status, "pending");
+    assert.equal(row!.grouping_receipt_id, null);
+    assert.equal(provider.hits(), hits, "no model request is sent while waiting for budget");
+  } finally {
+    for (const b of budgets) await sql`UPDATE budgets SET per_minute=${b.per_minute},per_hour=${b.per_hour},per_day=${b.per_day} WHERE service=${b.service}`;
+  }
+  await sql`UPDATE articles SET created_at=now()-interval '5 minutes' WHERE id=${id}`;
+  assert.equal((await sweepUngrouped()).enqueued, 1);
+  assert.equal((await sweepUngrouped()).enqueued, 0);
+  const boss = await getBoss();
+  const jobs = await boss.fetch(QUEUES.group);
+  assert.equal(jobs.length, 1);
+  assert.equal((jobs[0]!.data as { articleId: string }).articleId, id);
+  await groupArticle(id);
+  await boss.complete(QUEUES.group, jobs[0]!.id);
+  assert.equal((await sql`SELECT grouping_status FROM articles WHERE id=${id}`)[0]!.grouping_status, "complete");
 });
 
 test("a lost pending grouping job is repaired once, but a terminal failure waits for recovery", async () => {
