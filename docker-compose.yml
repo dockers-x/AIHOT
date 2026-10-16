@@ -1,21 +1,19 @@
-# docker compose up -d --build     → http://localhost:3000   (the admin is at /admin)
-# docker compose --profile https up -d --build   → HTTPS for SITE_DOMAIN through Caddy
 name: aihot
 
-x-app: &app
-  build: .
-  image: aihot-app
+x-image: &image
+  image: ${AIHOT_IMAGE:-ghcr.io/dockers-x/aihot:latest}
+  pull_policy: always
   restart: unless-stopped
 
 x-backend: &backend
-  <<: *app
-  env_file: .env
+  <<: *image
+  env_file:
+    - .env
   environment: &backend-env
     NODE_ENV: production
-    DATABASE_URL: postgres://aihot:${POSTGRES_PASSWORD:-aihot}@db:5432/aihot
+    DATABASE_URL: postgres://aihot:${POSTGRES_PASSWORD:?Run ./init-env.sh first}@db:5432/aihot
     AIHOT_DATA_DIR: /data
     API_BASE_URL: http://api:3001
-    # No proxy in front limits pushes to /api/ingest/items: the api does (per client and minute; 0 turns it off).
     INGEST_RATE_LIMIT: ${INGEST_RATE_LIMIT:-10}
   volumes:
     - data:/data
@@ -29,7 +27,7 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: aihot
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-aihot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run ./init-env.sh first}
       POSTGRES_DB: aihot
     volumes:
       - db:/var/lib/postgresql/data
@@ -39,7 +37,7 @@ services:
       timeout: 5s
       retries: 30
 
-  # Applies the database migrations and seeds the demo sources, then exits.
+  # Every start applies all pending migrations, then idempotently seeds the demo sources.
   setup:
     <<: *backend
     restart: "no"
@@ -59,17 +57,14 @@ services:
   worker:
     <<: *backend
     command: ["node", "apps/worker/src/main.ts"]
-    # On stop the worker lets a paid call in flight finish (STOP_TIMEOUT_MS, 195 s); Docker's default
-    # 10 s would kill it mid-call and leave "outcome unknown" receipts that are paid for again.
     stop_grace_period: 210s
     depends_on:
       setup:
         condition: service_completed_successfully
 
   web:
-    <<: *app
+    <<: *image
     command: ["node", "apps/web/server.ts"]
-    # SSR reads the API over HTTP; backend credentials and stored files stay in api/worker.
     environment:
       NODE_ENV: production
       API_BASE_URL: http://api:3001
@@ -84,22 +79,6 @@ services:
       api:
         condition: service_started
 
-  caddy:
-    image: caddy:2-alpine
-    profiles: ["https"]
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    environment:
-      SITE_DOMAIN: ${SITE_DOMAIN:-localhost}
-    volumes:
-      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy:/data
-    depends_on:
-      - web
-
 volumes:
   db: {}
   data: {}
-  caddy: {}
